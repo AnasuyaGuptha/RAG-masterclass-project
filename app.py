@@ -17,7 +17,7 @@ from langchain_groq import ChatGroq
 # CONFIG
 # --------------------------------------------------
 
-CORPUS_PATH = "./zyro-dynamics-hr-corpus"
+CORPUS_PATH = "."
 
 # Set your Groq API key as environment variable
 # For Streamlit Cloud use st.secrets["GROQ_API_KEY"]
