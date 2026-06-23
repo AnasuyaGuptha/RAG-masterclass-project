@@ -1,181 +1,97 @@
 import os
+import glob
 import streamlit as st
-from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_groq import ChatGroq
+from langsmith import traceable
 
-st.set_page_config(page_title="Zyro HR Help Desk", page_icon="🏢")
-st.title("🏢 Zyro Dynamics HR Help Desk")
+st.set_page_config(
+    page_title="Zyro Dynamics HR Help Desk",
+    page_icon="🏢",
+    layout="centered"
+)
 
-import re
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_PROJECT"]    = "zyro-rag-challenge"
 
-HR_KEYWORDS = {
-    "leave", "leaves", "sick", "casual", "earned",
-    "maternity", "paternity", "salary", "ctc",
-    "insurance", "benefit", "benefits", "esop",
-    "probation", "notice", "employee", "employees",
-    "onboarding", "separation", "termination",
-    "resignation", "travel", "expense", "reimbursement",
-    "wfh", "remote", "hybrid", "attendance",
-    "performance", "review", "pip", "promotion",
-    "policy", "conduct", "posh", "security",
-    "it", "device", "data", "holiday"
-}
+REFUSAL_MESSAGE = "I am sorry, I can only answer HR-related questions based on Zyro Dynamics policy documents. Please contact your HR team for other queries."
 
-def contains_hr_keyword(question):
-    question = question.lower()
+RAG_PROMPT = ChatPromptTemplate.from_template("""
+You are an HR assistant for Zyro Dynamics. Answer the employee question
+using ONLY the context provided below. Be accurate, concise and helpful.
+If the context does not contain enough information, say so honestly.
 
-    return any(
-        re.search(rf"\b{re.escape(keyword)}\b", question)
-        for keyword in HR_KEYWORDS
-    )
-    
-
-@st.cache_resource
-def load_pipeline():
-    corpus_path = os.environ.get(
-        "CORPUS_PATH",
-        os.path.join(os.path.dirname(__file__), "zyro-dynamics-hr-corpus"),
-    )
-
-    loader = PyPDFDirectoryLoader(corpus_path)
-    docs = loader.load()
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-
-    chunks = splitter.split_documents(docs)
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-    )
-
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 6},
-    )
-
-    groq_key = (
-        st.secrets.get("GROQ_API_KEY")
-        or os.environ.get("GROQ_API_KEY")
-    )
-
-    if not groq_key:
-        st.error(
-            'GROQ_API_KEY not found! Add it in Streamlit secrets.'
-        )
-        st.stop()
-
-    llm = ChatGroq(
-        model="openai/gpt-oss-120b",
-        temperature=0.1,
-        max_tokens=512,
-        api_key=groq_key,
-    )
-
-    rag_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """
-You are an HR assistant for Zyro Dynamics.
-
-Answer ONLY using the retrieved context.
-
-RULES:
-
-1. Use only information explicitly present in the provided context.
-2. Do not use external knowledge.
-3. Do not infer, assume, or invent information.
-4. If the answer is not explicitly available in the context, respond exactly:
-
-I cannot answer this based on the available HR policy documents.
-
-5. Answer only the specific question asked.
-6. Do NOT reproduce entire policy documents.
-7. Keep answers concise and focused.
-8. Maximum answer length: 120 words.
-9. Use bullet points when appropriate.
-10. Always include exact:
-   - numbers
-   - durations
-   - dates
-   - percentages
-   - amounts
-   - eligibility criteria
-   - approval requirements
-11. Mention the relevant policy name whenever available.
-12. If multiple policies are retrieved, answer only from the policy relevant to the question.
-13. Do not include unrelated sections of a policy.
-"""
-    ),
-    (
-        "human",
-        """
 Context:
 {context}
 
-Question:
-{question}
+Question: {question}
 
-Provide a concise answer focused only on the information required to answer the question.
-"""
-    ),
-])
+Answer:""")
 
-    oos_prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            """
-You are a classifier for an HR help desk.
+OOS_PROMPT = ChatPromptTemplate.from_template("""
+You are a classifier. Is the question below related to HR policies,
+employee benefits, workplace rules, or company procedures?
+Reply with ONLY yes or no.
 
-Determine if the question can be answered using Zyro Dynamics HR policy documents.
+Question: {question}
+""")
 
-Topics covered:
-- Company profile
-- Employee handbook
-- Leave policy
-- Work from home
-- Compensation & benefits
-- Insurance
-- ESOPs
-- POSH
-- IT policy
-- Performance review
-- Travel policy
-- Onboarding
-- Separation
+@st.cache_resource(show_spinner="Loading HR documents and building knowledge base...")
+def build_pipeline():
+    os.environ["GROQ_API_KEY"]      = st.secrets["GROQ_API_KEY"]
+    os.environ["LANGCHAIN_API_KEY"] = st.secrets["LANGCHAIN_API_KEY"]
 
-Respond with EXACTLY ONE WORD:
+    pdf_files = glob.glob("hr_docs/*.pdf")
+    documents = []
+    for pdf_path in sorted(pdf_files):
+        loader = PyPDFLoader(pdf_path)
+        documents.extend(loader.load())
 
-IN_SCOPE
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks   = splitter.split_documents(documents)
 
-or
+    embeddings  = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    retriever   = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 5, "fetch_k": 10}
+    )
 
-OUT_OF_SCOPE
-"""
-        ),
-        ("human", "Question: {question}")
-    ])
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1, max_tokens=512)
+    return retriever, llm
 
-    def format_docs(docs):
-        return "\n\n---\n\n".join(
-            [
-                f"Source: {d.metadata.get('source', 'Unknown')}\n{d.page_content}"
-                for d in docs
-            ]
-        )
+def format_docs(docs):
+    return "\n\n".join(
+        f"[Source: {os.path.basename(doc.metadata.get('source', 'Unknown'))}]\n{doc.page_content}"
+        for doc in docs
+    )
 
-    return retriever, llm, rag_prompt, oos_prompt, format_docs
+@traceable(name="rag_chain")
+def rag_chain(question, retriever, llm):
+    docs     = retriever.invoke(question)
+    context  = format_docs(docs)
+    prompt   = RAG_PROMPT.format(context=context, question=question)
+    response = llm.invoke(prompt)
+    sources  = list({os.path.basename(doc.metadata.get("source", "Unknown")) for doc in docs})
+    return {"answer": response.content, "sources": sources}
 
+@traceable(name="ask_bot")
+def ask_bot(question, retriever, llm):
+    check    = OOS_PROMPT.format(question=question)
+    response = llm.invoke(check)
+    if "yes" in response.content.strip().lower():
+        return rag_chain(question, retriever, llm)
+    return {"answer": REFUSAL_MESSAGE, "sources": []}
+
+# ── UI ──────────────────────────────────────────────────────
+st.title("🏢 Zyro Dynamics HR Help Desk")
+st.caption("Ask any HR policy question — powered by RAG")
+
+retriever, llm = build_pipeline()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -183,94 +99,27 @@ if "messages" not in st.session_state:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-
-        if "sources" in msg and msg["sources"]:
-            with st.expander("Sources"):
+        if msg.get("sources"):
+            with st.expander("📄 Sources"):
                 for s in msg["sources"]:
-                    st.write(f"- {os.path.basename(s)}")
+                    st.caption(s)
 
-
-if prompt := st.chat_input("Ask your HR question..."):
-
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": prompt
-        }
-    )
-
+if question := st.chat_input("Ask an HR question..."):
+    st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(question)
 
     with st.chat_message("assistant"):
-
         with st.spinner("Searching HR policies..."):
+            result = ask_bot(question, retriever, llm)
+        st.markdown(result["answer"])
+        if result["sources"]:
+            with st.expander("📄 Sources"):
+                for s in result["sources"]:
+                    st.caption(s)
 
-            retriever, llm, rag_prompt, oos_prompt, format_docs = load_pipeline()
-    if not contains_hr_keyword(prompt):
-
-        answer = (
-            "I can only answer questions about Zyro Dynamics HR policies "
-            "from the provided documents."
-        )
-    
-        sources = []
-    
-    else:
-    
-        guard_chain = oos_prompt | llm | StrOutputParser()
-    
-        guard_result = guard_chain.invoke(
-            {"question": prompt}
-        )
-    
-        if guard_result.strip().upper() != "IN_SCOPE":
-    
-            answer = (
-                "I can only answer questions about Zyro Dynamics HR policies "
-                "from the provided documents."
-            )
-    
-            sources = []
-    
-        else:
-    
-            docs = retriever.invoke(prompt)
-    
-            context = format_docs(docs)
-    
-            chain = rag_prompt | llm | StrOutputParser()
-    
-            answer = chain.invoke({
-                "context": context,
-                "question": prompt
-            })
-    
-            sources = list(
-                set(
-                    d.metadata.get("source", "Unknown")
-                    for d in docs
-                )
-            )
-    
-    # SHOW ANSWER FOR BOTH RIGHT AND WRONG QUESTIONS
-    
-    st.markdown(answer)
-    
-    if sources:
-    
-        with st.expander("Sources"):
-    
-            for s in sources:
-    
-                st.write(
-                    f"- {os.path.basename(s)}"
-                )
-    
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": answer,
-            "sources": sources,
-        }
-    )
+    st.session_state.messages.append({
+        "role":    "assistant",
+        "content": result["answer"],
+        "sources": result["sources"]
+    })
