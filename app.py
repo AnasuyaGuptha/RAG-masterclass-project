@@ -45,7 +45,7 @@ def build_pipeline():
     os.environ["GROQ_API_KEY"]      = st.secrets["GROQ_API_KEY"]
     os.environ["LANGCHAIN_API_KEY"] = st.secrets["LANGCHAIN_API_KEY"]
 
-    pdf_files = glob.glob("hr_docs/*.pdf")
+    pdf_files = glob.glob("zyro-dynamics-hr-corpus/*.pdf")
     documents = []
     for pdf_path in sorted(pdf_files):
         loader = PyPDFLoader(pdf_path)
