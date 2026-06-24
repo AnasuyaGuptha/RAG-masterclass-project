@@ -21,23 +21,25 @@ os.environ["LANGCHAIN_PROJECT"]    = "zyro-rag-challenge"
 REFUSAL_MESSAGE = "I am sorry, I can only answer HR-related questions based on Zyro Dynamics policy documents. Please contact your HR team for other queries."
 
 RAG_PROMPT = ChatPromptTemplate.from_template("""
-You are an HR assistant for Zyro Dynamics. Answer the employee question
-using ONLY the context provided below. Be accurate, concise and helpful.
-If the context does not contain enough information, say so honestly.
+You are an HR policy assistant.
+
+Use ONLY the supplied context.
+
+Rules:
+1. Answer directly.
+2. Include exact numbers, dates, durations, percentages, grades, and policy names whenever available.
+3. If multiple policy clauses apply, combine them.
+4. Do not make assumptions.
+5. If the answer is not in the context, say:
+   "I could not find this information in the provided HR policy documents."
 
 Context:
 {context}
 
-Question: {question}
+Question:
+{question}
 
-Answer:""")
-
-OOS_PROMPT = ChatPromptTemplate.from_template("""
-You are a classifier. Is the question below related to HR policies,
-employee benefits, workplace rules, or company procedures?
-Reply with ONLY yes or no.
-
-Question: {question}
+Answer:
 """)
 
 @st.cache_resource(show_spinner="Loading HR documents and building knowledge base...")
@@ -45,20 +47,20 @@ def build_pipeline():
     os.environ["GROQ_API_KEY"]      = st.secrets["GROQ_API_KEY"]
     os.environ["LANGCHAIN_API_KEY"] = st.secrets["LANGCHAIN_API_KEY"]
 
-    pdf_files = glob.glob("zyro-dynamics-hr-corpus/*.pdf")
+    pdf_files = glob.glob("hr_docs/*.pdf")
     documents = []
     for pdf_path in sorted(pdf_files):
         loader = PyPDFLoader(pdf_path)
         documents.extend(loader.load())
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=150)
     chunks   = splitter.split_documents(documents)
 
-    embeddings  = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embeddings  = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
     vectorstore = FAISS.from_documents(chunks, embeddings)
     retriever   = vectorstore.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 5, "fetch_k": 10}
+        search_kwargs={"k": 8, "fetch_k": 20}
     )
 
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1, max_tokens=512)
@@ -123,3 +125,5 @@ if question := st.chat_input("Ask an HR question..."):
         "content": result["answer"],
         "sources": result["sources"]
     })
+
+    
